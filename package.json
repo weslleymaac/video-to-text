@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@distube/ytdl-core": "^4.16.12",
     "lucide-react": "^0.441.0",
     "next": "14.2.5",
     "openai": "^6.33.0",

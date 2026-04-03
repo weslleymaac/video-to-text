@@ -1,107 +1,69 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
-import { execSync } from "child_process";
-import { writeFileSync, readFileSync, mkdtempSync, rmSync, readdirSync } from "fs";
-import { join } from "path";
-import { tmpdir } from "os";
+
+export const maxDuration = 300;
+
+const MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB - limite da API Whisper
 
 function getClient() {
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error("OPENAI_API_KEY não configurada nas variáveis de ambiente.");
-  }
+  if (!apiKey) throw new Error("OPENAI_API_KEY não configurada nas variáveis de ambiente.");
   return new OpenAI({ apiKey });
 }
 
-function downloadYoutubeAudio(url: string) {
-  const tmp = mkdtempSync(join(tmpdir(), "yt-"));
+function formatDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h) return `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`;
+  return `${m}m ${String(s).padStart(2, "0")}s`;
+}
 
-  // Get video info
-  let title = "";
-  let duration = "";
-  try {
-    const infoRaw = execSync(
-      `yt-dlp --dump-json --no-download "${url}"`,
-      { timeout: 30000, encoding: "utf-8" }
-    );
-    const info = JSON.parse(infoRaw);
-    title = info.title || "";
-    const durSecs = info.duration || 0;
-    if (durSecs > 2.5 * 60 * 60) {
-      rmSync(tmp, { recursive: true, force: true });
-      throw new Error(`Vídeo muito longo (${Math.round(durSecs / 60)}min). O limite é 2h30.`);
-    }
-    if (durSecs) {
-      const h = Math.floor(durSecs / 3600);
-      const m = Math.floor((durSecs % 3600) / 60);
-      const s = Math.floor(durSecs % 60);
-      duration = h
-        ? `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`
-        : `${m}m ${String(s).padStart(2, "0")}s`;
-    }
-  } catch (e: any) {
-    if (e.message?.includes("limite")) throw e;
+async function downloadYoutubeAudio(url: string): Promise<{ buffer: Buffer; title: string; duration: string }> {
+  const ytdl = (await import("@distube/ytdl-core")).default;
+
+  const info = await ytdl.getInfo(url);
+  const title = info.videoDetails.title;
+  const durSecs = parseInt(info.videoDetails.lengthSeconds) || 0;
+
+  if (durSecs > 2.5 * 60 * 60) {
+    throw new Error(`Vídeo muito longo (${Math.round(durSecs / 60)}min). O limite é 2h30.`);
   }
 
-  // Download audio
-  execSync(
-    `yt-dlp --extract-audio --audio-format mp3 --audio-quality 5 --no-playlist -o "${join(tmp, "audio.%(ext)s")}" "${url}"`,
-    { timeout: 600000, encoding: "utf-8" }
-  );
+  const duration = durSecs ? formatDuration(durSecs) : "";
 
-  return { filePath: join(tmp, "audio.mp3"), tmpDir: tmp, title, duration };
-}
-
-function splitAudio(filePath: string, tmpDir: string): string[] {
-  const stats = readFileSync(filePath);
-  if (stats.length <= 24 * 1024 * 1024) return [filePath];
-
-  const chunksDir = join(tmpDir, "chunks");
-  execSync(`mkdir -p "${chunksDir}"`);
-  execSync(
-    `ffmpeg -i "${filePath}" -f segment -segment_time 600 -c copy -reset_timestamps 1 "${join(chunksDir, "chunk_%03d.mp3")}"`,
-    { timeout: 120000 }
-  );
-
-  const files = readdirSync(chunksDir)
-    .filter((f) => f.startsWith("chunk_") && f.endsWith(".mp3"))
-    .sort()
-    .map((f) => join(chunksDir, f));
-
-  if (files.length === 0) throw new Error("Erro ao dividir o áudio.");
-  return files;
-}
-
-async function transcribeFile(client: OpenAI, filePath: string): Promise<string> {
-  const fileBuffer = readFileSync(filePath);
-  const file = new File([fileBuffer], "audio.mp3", { type: "audio/mpeg" });
-
-  const transcript = await client.audio.transcriptions.create({
-    model: "whisper-1",
-    file,
-    response_format: "text",
+  // Pegar formato de áudio apenas, menor qualidade para caber no limite
+  const format = ytdl.chooseFormat(info.formats, {
+    quality: "lowestaudio",
+    filter: "audioonly",
   });
 
-  return transcript as unknown as string;
-}
-
-async function transcribeAudio(
-  client: OpenAI,
-  filePath: string,
-  tmpDir: string
-): Promise<string> {
-  const chunks = splitAudio(filePath, tmpDir);
-  const results: string[] = [];
-
-  for (const chunk of chunks) {
-    const text = await transcribeFile(client, chunk);
-    results.push(text);
+  if (!format) {
+    throw new Error("Não foi possível encontrar um formato de áudio para este vídeo.");
   }
 
-  return results.join(" ");
-}
+  // Baixar o áudio via fetch (funciona em serverless)
+  const response = await fetch(format.url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    },
+  });
 
-export const maxDuration = 600; // 10 minutes
+  if (!response.ok) {
+    throw new Error("Erro ao baixar o áudio do YouTube.");
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  if (buffer.length > MAX_FILE_SIZE) {
+    throw new Error(
+      `Áudio muito grande (${(buffer.length / (1024 * 1024)).toFixed(1)}MB). Limite: 25MB. Tente um vídeo mais curto.`
+    );
+  }
+
+  return { buffer, title, duration };
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -121,14 +83,20 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: "URL inválida. Insira um link válido do YouTube." }, { status: 400 });
       }
 
-      const { filePath, tmpDir, title, duration } = downloadYoutubeAudio(youtubeUrl);
+      const { buffer, title, duration } = await downloadYoutubeAudio(youtubeUrl);
 
-      try {
-        const transcript = await transcribeAudio(client, filePath, tmpDir);
-        return NextResponse.json({ transcript, title, duration });
-      } finally {
-        rmSync(tmpDir, { recursive: true, force: true });
-      }
+      const file = new File([new Uint8Array(buffer)], "audio.webm", { type: "audio/webm" });
+      const transcript = await client.audio.transcriptions.create({
+        model: "whisper-1",
+        file,
+        response_format: "text",
+      });
+
+      return NextResponse.json({
+        transcript: transcript as unknown as string,
+        title,
+        duration,
+      });
 
     } else if (contentType.includes("multipart/form-data")) {
       // Upload mode
@@ -139,24 +107,32 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: "Nenhum arquivo enviado." }, { status: 400 });
       }
 
-      const tmp = mkdtempSync(join(tmpdir(), "upload-"));
-      const filePath = join(tmp, file.name);
-      const bytes = await file.arrayBuffer();
-      writeFileSync(filePath, Buffer.from(bytes));
-
-      try {
-        const transcript = await transcribeAudio(client, filePath, tmp);
-        return NextResponse.json({ transcript, title: file.name, duration: "" });
-      } finally {
-        rmSync(tmp, { recursive: true, force: true });
+      if (file.size > MAX_FILE_SIZE) {
+        return NextResponse.json(
+          { error: `Arquivo muito grande (${(file.size / (1024 * 1024)).toFixed(1)}MB). Limite: 25MB.` },
+          { status: 400 }
+        );
       }
+
+      const transcript = await client.audio.transcriptions.create({
+        model: "whisper-1",
+        file,
+        response_format: "text",
+      });
+
+      return NextResponse.json({
+        transcript: transcript as unknown as string,
+        title: file.name,
+        duration: "",
+      });
 
     } else {
       return NextResponse.json({ error: "Content-Type não suportado." }, { status: 400 });
     }
   } catch (e: any) {
+    console.error("Transcribe error:", e);
     const msg = e.message || "Erro interno do servidor.";
-    const status = msg.includes("limite") || msg.includes("obrigatória") || msg.includes("inválida") ? 400 : 500;
-    return NextResponse.json({ error: msg }, { status });
+    const status = msg.includes("limite") || msg.includes("obrigatória") || msg.includes("inválida") || msg.includes("grande") ? 400 : 500;
+    return NextResponse.json({ error: `Erro interno: ${msg}` }, { status });
   }
 }
