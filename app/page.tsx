@@ -21,9 +21,108 @@ import {
 } from "lucide-react";
 
 const ACCESS_CODE = "676975";
+const MAX_UPLOAD_SIZE = 100 * 1024 * 1024; // 100MB
+const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB por chunk (limite Vercel ~4.5MB)
 
 type TabType = "youtube" | "upload";
 type Status = "idle" | "loading" | "success" | "error";
+
+async function compressAudioWithFFmpeg(
+  file: File,
+  onProgress: (msg: string) => void
+): Promise<Blob[]> {
+  onProgress("Carregando processador de áudio...");
+
+  const { FFmpeg } = await import("@ffmpeg/ffmpeg");
+  const { fetchFile, toBlobURL } = await import("@ffmpeg/util");
+
+  const ffmpeg = new FFmpeg();
+
+  const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm";
+  await ffmpeg.load({
+    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+  });
+
+  onProgress("Extraindo e comprimindo áudio...");
+
+  await ffmpeg.writeFile("input", await fetchFile(file));
+
+  // Extrair áudio, comprimir para speech (mono, 16kHz, 48kbps)
+  await ffmpeg.exec([
+    "-i", "input",
+    "-vn",           // sem vídeo
+    "-ac", "1",      // mono
+    "-ar", "16000",  // 16kHz (o que o Whisper usa internamente)
+    "-b:a", "48k",   // 48kbps
+    "-f", "mp3",
+    "output.mp3",
+  ]);
+
+  const outputData = (await ffmpeg.readFile("output.mp3")) as Uint8Array;
+  const totalSize = outputData.byteLength;
+
+  // Se cabe num único request, retorna direto
+  if (totalSize <= CHUNK_SIZE) {
+    onProgress("Áudio pronto para transcrição...");
+    return [new Blob([new Uint8Array(outputData)], { type: "audio/mpeg" })];
+  }
+
+  // Senão, divide em chunks com FFmpeg (por tempo)
+  onProgress("Dividindo áudio em partes...");
+
+  // Calcular duração aproximada do áudio
+  // 48kbps = 6000 bytes/s → chunk de 4MB ≈ 700s ≈ 11min
+  const chunkDurationSecs = Math.floor((CHUNK_SIZE / (48000 / 8)) * 0.9); // margem de 10%
+
+  await ffmpeg.exec([
+    "-i", "output.mp3",
+    "-f", "segment",
+    "-segment_time", String(chunkDurationSecs),
+    "-c", "copy",
+    "-reset_timestamps", "1",
+    "chunk_%03d.mp3",
+  ]);
+
+  // Ler todos os chunks
+  const chunks: Blob[] = [];
+  for (let i = 0; i < 100; i++) {
+    const name = `chunk_${String(i).padStart(3, "0")}.mp3`;
+    try {
+      const data = await ffmpeg.readFile(name);
+      chunks.push(new Blob([new Uint8Array(data as Uint8Array)], { type: "audio/mpeg" }));
+    } catch {
+      break;
+    }
+  }
+
+  onProgress(`Áudio dividido em ${chunks.length} partes...`);
+  return chunks;
+}
+
+async function sendChunkForTranscription(chunk: Blob, index: number): Promise<string> {
+  const formData = new FormData();
+  formData.append("file", chunk, `chunk_${index}.mp3`);
+
+  const response = await fetch("/api/transcribe", {
+    method: "POST",
+    body: formData,
+  });
+
+  const text = await response.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("Erro no servidor ao transcrever parte do áudio.");
+  }
+
+  if (!response.ok) {
+    throw new Error(data.error || "Erro ao transcrever parte do áudio.");
+  }
+
+  return data.transcript;
+}
 
 export default function Home() {
   const [authenticated, setAuthenticated] = useState(false);
@@ -35,6 +134,7 @@ export default function Home() {
   const [transcript, setTranscript] = useState("");
   const [status, setStatus] = useState<Status>("idle");
   const [progress, setProgress] = useState(0);
+  const [progressMsg, setProgressMsg] = useState("");
   const [errorMsg, setErrorMsg] = useState("");
   const [copied, setCopied] = useState(false);
   const [dragOver, setDragOver] = useState(false);
@@ -69,78 +169,93 @@ export default function Home() {
     setTranscript("");
     setErrorMsg("");
     setProgress(0);
+    setProgressMsg("");
     setVideoTitle("");
     setDuration("");
 
-    const progressInterval = setInterval(() => {
-      setProgress((prev) => {
-        if (prev >= 95) return prev;
-        const increment = prev < 30 ? Math.random() * 5 : prev < 60 ? Math.random() * 3 : Math.random() * 1;
-        return Math.min(prev + increment, 95);
-      });
-    }, 1500);
-
     try {
-      let response: Response;
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10 * 60 * 1000); // 10 min timeout
-
       if (activeTab === "youtube") {
+        // YouTube mode
         if (!youtubeUrl.trim()) {
           throw new Error("Por favor, insira o link do YouTube.");
         }
-        response = await fetch("/api/transcribe", {
+
+        setProgressMsg("Buscando transcrição do YouTube...");
+        setProgress(30);
+
+        const response = await fetch("/api/transcribe", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ youtube_url: youtubeUrl.trim() }),
-          signal: controller.signal,
         });
+
+        const text = await response.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          throw new Error("Erro no servidor. Tente novamente.");
+        }
+
+        if (!response.ok) {
+          throw new Error(data.error || "Erro ao transcrever o vídeo.");
+        }
+
+        setProgress(100);
+        setTranscript(data.transcript);
+        if (data.title) setVideoTitle(data.title);
+        if (data.duration) setDuration(data.duration);
+
       } else {
+        // Upload mode - processa no browser com FFmpeg
         if (!uploadedFile) {
           throw new Error("Por favor, selecione um arquivo de vídeo/áudio.");
         }
-        if (uploadedFile.size > 4.5 * 1024 * 1024) {
+
+        if (uploadedFile.size > MAX_UPLOAD_SIZE) {
           throw new Error(
-            `Arquivo muito grande (${(uploadedFile.size / (1024 * 1024)).toFixed(1)}MB). O limite para upload é 4.5MB. Comprima o áudio antes de enviar.`
+            `Arquivo muito grande (${(uploadedFile.size / (1024 * 1024)).toFixed(0)}MB). O limite é 100MB.`
           );
         }
-        const formData = new FormData();
-        formData.append("file", uploadedFile);
-        response = await fetch("/api/transcribe", {
-          method: "POST",
-          body: formData,
-          signal: controller.signal,
+
+        setProgress(5);
+
+        // Comprimir áudio no browser
+        const chunks = await compressAudioWithFFmpeg(uploadedFile, (msg) => {
+          setProgressMsg(msg);
+          setProgress((prev) => Math.min(prev + 10, 40));
         });
+
+        setProgress(40);
+
+        // Enviar cada chunk para transcrição
+        const transcripts: string[] = [];
+        for (let i = 0; i < chunks.length; i++) {
+          setProgressMsg(
+            chunks.length > 1
+              ? `Transcrevendo parte ${i + 1} de ${chunks.length}...`
+              : "Transcrevendo com IA..."
+          );
+
+          const chunkTranscript = await sendChunkForTranscription(chunks[i], i);
+          transcripts.push(chunkTranscript);
+
+          setProgress(40 + Math.round(((i + 1) / chunks.length) * 55));
+        }
+
+        setProgress(100);
+        setTranscript(transcripts.join(" "));
+        setVideoTitle(uploadedFile.name);
       }
 
-      clearTimeout(timeoutId);
-
-      const text = await response.text();
-      let data;
-      try {
-        data = JSON.parse(text);
-      } catch {
-        throw new Error("Erro no servidor. Tente novamente.");
-      }
-
-      if (!response.ok) {
-        throw new Error(data.error || "Erro ao transcrever o vídeo.");
-      }
-
-      setProgress(100);
-      setTranscript(data.transcript);
-      if (data.title) setVideoTitle(data.title);
-      if (data.duration) setDuration(data.duration);
       setStatus("success");
     } catch (err: any) {
       if (err.name === "AbortError") {
-        setErrorMsg("Timeout: o processamento demorou mais de 10 minutos. Tente um vídeo mais curto.");
+        setErrorMsg("Timeout: o processamento demorou demais.");
       } else {
         setErrorMsg(err.message || "Erro inesperado.");
       }
       setStatus("error");
-    } finally {
-      clearInterval(progressInterval);
     }
   };
 
@@ -164,9 +279,7 @@ export default function Home() {
     e.preventDefault();
     setDragOver(false);
     const file = e.dataTransfer.files[0];
-    if (file) {
-      setUploadedFile(file);
-    }
+    if (file) setUploadedFile(file);
   }, []);
 
   const handleDragOver = useCallback((e: React.DragEvent) => {
@@ -320,7 +433,7 @@ export default function Home() {
           {activeTab === "upload" && (
             <div className="space-y-4">
               <label className="block text-sm font-medium text-[var(--text-secondary)] mb-1.5">
-                Arquivo de vídeo ou áudio
+                Arquivo de vídeo ou áudio (até 100MB)
               </label>
               <div
                 onDrop={handleDrop}
@@ -375,7 +488,7 @@ export default function Home() {
                       </span>
                     </p>
                     <p className="text-xs text-[var(--text-secondary)] mt-1.5 opacity-60">
-                      MP4, MP3, WAV, M4A, WebM, OGG, AVI, MOV
+                      MP4, MP3, WAV, M4A, WebM, OGG, AVI, MOV — até 100MB
                     </p>
                   </>
                 )}
@@ -388,7 +501,7 @@ export default function Home() {
             <div className="mt-6">
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs text-[var(--text-secondary)]">
-                  {progress < 30 ? "Baixando áudio..." : progress < 70 ? "Transcrevendo com IA..." : "Finalizando..."}
+                  {progressMsg || "Processando..."}
                 </span>
                 <span className="text-xs text-purple-600 font-mono">
                   {Math.round(progress)}%
@@ -424,7 +537,7 @@ export default function Home() {
             {status === "loading" ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Transcrevendo...
+                Processando...
               </>
             ) : (
               <>
@@ -499,7 +612,7 @@ export default function Home() {
 
         {/* Footer */}
         <footer className="mt-12 text-center text-xs text-[var(--text-secondary)] opacity-50">
-          Feito com Next.js + Python + OpenAI Whisper
+          Feito com Next.js + OpenAI Whisper
         </footer>
       </div>
     </div>
