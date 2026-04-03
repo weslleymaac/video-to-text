@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import OpenAI from "openai";
+import { YoutubeTranscript } from "youtube-transcript";
 
 export const maxDuration = 300;
 
@@ -11,67 +12,43 @@ function getClient() {
   return new OpenAI({ apiKey });
 }
 
-function formatDuration(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60);
-  if (h) return `${h}h ${String(m).padStart(2, "0")}m ${String(s).padStart(2, "0")}s`;
-  return `${m}m ${String(s).padStart(2, "0")}s`;
+function extractVideoId(url: string): string {
+  const patterns = [
+    /(?:youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
+    /(?:youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+    /(?:youtube\.com\/embed\/)([a-zA-Z0-9_-]{11})/,
+    /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/,
+  ];
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match) return match[1];
+  }
+  throw new Error("Não foi possível extrair o ID do vídeo. Verifique o link.");
 }
 
-async function downloadYoutubeAudio(url: string): Promise<{ buffer: Buffer; title: string; duration: string }> {
-  const ytdl = (await import("@distube/ytdl-core")).default;
+async function getYoutubeTranscript(url: string): Promise<{ transcript: string; title: string }> {
+  const videoId = extractVideoId(url);
 
-  const info = await ytdl.getInfo(url);
-  const title = info.videoDetails.title;
-  const durSecs = parseInt(info.videoDetails.lengthSeconds) || 0;
+  const items = await YoutubeTranscript.fetchTranscript(videoId, { lang: "pt" }).catch(() =>
+    YoutubeTranscript.fetchTranscript(videoId)
+  );
 
-  if (durSecs > 2.5 * 60 * 60) {
-    throw new Error(`Vídeo muito longo (${Math.round(durSecs / 60)}min). O limite é 2h30.`);
-  }
-
-  const duration = durSecs ? formatDuration(durSecs) : "";
-
-  // Pegar formato de áudio apenas, menor qualidade para caber no limite
-  const format = ytdl.chooseFormat(info.formats, {
-    quality: "lowestaudio",
-    filter: "audioonly",
-  });
-
-  if (!format) {
-    throw new Error("Não foi possível encontrar um formato de áudio para este vídeo.");
-  }
-
-  // Baixar o áudio via fetch (funciona em serverless)
-  const response = await fetch(format.url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error("Erro ao baixar o áudio do YouTube.");
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-
-  if (buffer.length > MAX_FILE_SIZE) {
+  if (!items || items.length === 0) {
     throw new Error(
-      `Áudio muito grande (${(buffer.length / (1024 * 1024)).toFixed(1)}MB). Limite: 25MB. Tente um vídeo mais curto.`
+      "Este vídeo não possui legendas/transcrição disponível no YouTube. Use a aba Upload para enviar o arquivo de áudio."
     );
   }
 
-  return { buffer, title, duration };
+  const transcript = items.map((item) => item.text).join(" ");
+  return { transcript, title: videoId };
 }
 
 export async function POST(request: NextRequest) {
   try {
-    const client = getClient();
     const contentType = request.headers.get("content-type") || "";
 
     if (contentType.includes("application/json")) {
-      // YouTube mode
+      // YouTube mode - busca legendas direto do YouTube
       const data = await request.json();
       const youtubeUrl = (data.youtube_url || "").trim();
 
@@ -83,23 +60,13 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: "URL inválida. Insira um link válido do YouTube." }, { status: 400 });
       }
 
-      const { buffer, title, duration } = await downloadYoutubeAudio(youtubeUrl);
+      const { transcript, title } = await getYoutubeTranscript(youtubeUrl);
 
-      const file = new File([new Uint8Array(buffer)], "audio.webm", { type: "audio/webm" });
-      const transcript = await client.audio.transcriptions.create({
-        model: "whisper-1",
-        file,
-        response_format: "text",
-      });
-
-      return NextResponse.json({
-        transcript: transcript as unknown as string,
-        title,
-        duration,
-      });
+      return NextResponse.json({ transcript, title, duration: "" });
 
     } else if (contentType.includes("multipart/form-data")) {
-      // Upload mode
+      // Upload mode - transcreve com Whisper
+      const client = getClient();
       const formData = await request.formData();
       const file = formData.get("file") as File | null;
 
@@ -132,7 +99,7 @@ export async function POST(request: NextRequest) {
   } catch (e: any) {
     console.error("Transcribe error:", e);
     const msg = e.message || "Erro interno do servidor.";
-    const status = msg.includes("limite") || msg.includes("obrigatória") || msg.includes("inválida") || msg.includes("grande") ? 400 : 500;
-    return NextResponse.json({ error: `Erro interno: ${msg}` }, { status });
+    const status = msg.includes("obrigatória") || msg.includes("inválida") || msg.includes("grande") || msg.includes("legendas") ? 400 : 500;
+    return NextResponse.json({ error: msg }, { status });
   }
 }
