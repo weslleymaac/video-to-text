@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import {
   Youtube,
   Upload,
@@ -16,12 +16,19 @@ import {
   Globe,
   Clock,
   AlertCircle,
+  Lock,
+  LogOut,
 } from "lucide-react";
+
+const ACCESS_CODE = "676975";
 
 type TabType = "youtube" | "upload";
 type Status = "idle" | "loading" | "success" | "error";
 
 export default function Home() {
+  const [authenticated, setAuthenticated] = useState(false);
+  const [password, setPassword] = useState("");
+  const [loginError, setLoginError] = useState(false);
   const [activeTab, setActiveTab] = useState<TabType>("youtube");
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
@@ -34,6 +41,28 @@ export default function Home() {
   const [videoTitle, setVideoTitle] = useState("");
   const [duration, setDuration] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (localStorage.getItem("vt_auth") === "true") {
+      setAuthenticated(true);
+    }
+  }, []);
+
+  const handleLogin = () => {
+    if (password === ACCESS_CODE) {
+      localStorage.setItem("vt_auth", "true");
+      setAuthenticated(true);
+      setLoginError(false);
+    } else {
+      setLoginError(true);
+    }
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem("vt_auth");
+    setAuthenticated(false);
+    setPassword("");
+  };
 
   const handleTranscribe = async () => {
     setStatus("loading");
@@ -143,6 +172,58 @@ export default function Home() {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
+  if (!authenticated) {
+    return (
+      <div className="min-h-screen dot-pattern relative flex items-center justify-center">
+        <div className="fixed inset-0 overflow-hidden pointer-events-none">
+          <div className="absolute -top-40 -left-40 w-96 h-96 bg-purple-300/20 rounded-full blur-[120px] animate-pulse-slow" />
+          <div className="absolute top-1/3 -right-40 w-80 h-80 bg-violet-300/20 rounded-full blur-[100px] animate-pulse-slow" />
+          <div className="absolute -bottom-40 left-1/3 w-72 h-72 bg-indigo-300/15 rounded-full blur-[100px] animate-pulse-slow" />
+        </div>
+
+        <div className="relative z-10 w-full max-w-sm mx-auto px-4">
+          <div className="glass-strong rounded-2xl p-8 glow-purple-sm text-center">
+            <div className="inline-flex items-center justify-center w-14 h-14 rounded-full bg-purple-100 mb-5">
+              <Lock className="w-7 h-7 text-purple-600" />
+            </div>
+            <h1 className="text-2xl font-bold text-gray-800 mb-2">Acesso Restrito</h1>
+            <p className="text-sm text-[var(--text-secondary)] mb-6">
+              Digite a senha para acessar o sistema.
+            </p>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                handleLogin();
+              }}
+            >
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  setLoginError(false);
+                }}
+                placeholder="Senha de acesso"
+                className="input-field w-full px-4 py-3.5 rounded-xl text-sm text-center tracking-widest"
+                autoFocus
+              />
+              {loginError && (
+                <p className="text-xs text-red-500 mt-2">Senha incorreta.</p>
+              )}
+              <button
+                type="submit"
+                className="btn-primary w-full mt-4 py-3.5 rounded-xl text-sm font-semibold text-white flex items-center justify-center gap-2"
+              >
+                <Lock className="w-4 h-4" />
+                Entrar
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen dot-pattern relative">
       {/* Background gradient orbs */}
@@ -153,6 +234,15 @@ export default function Home() {
       </div>
 
       <div className="relative z-10 max-w-3xl mx-auto px-4 sm:px-6 py-10 sm:py-16">
+        {/* Logout button */}
+        <button
+          onClick={handleLogout}
+          className="absolute top-4 right-4 sm:top-6 sm:right-6 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-[var(--text-secondary)] hover:text-gray-800 hover:bg-gray-100 border border-[var(--border-color)] transition-all z-20"
+        >
+          <LogOut className="w-3.5 h-3.5" />
+          Sair
+        </button>
+
         {/* Header */}
         <header className="text-center mb-10 sm:mb-14">
           <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full glass-strong text-xs text-purple-600 mb-6 animate-float">
