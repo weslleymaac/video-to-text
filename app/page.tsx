@@ -99,6 +99,11 @@ export default function Home() {
         if (!uploadedFile) {
           throw new Error("Por favor, selecione um arquivo de vídeo/áudio.");
         }
+        if (uploadedFile.size > 4.5 * 1024 * 1024) {
+          throw new Error(
+            `Arquivo muito grande (${(uploadedFile.size / (1024 * 1024)).toFixed(1)}MB). O limite para upload é 4.5MB. Comprima o áudio antes de enviar.`
+          );
+        }
         const formData = new FormData();
         formData.append("file", uploadedFile);
         response = await fetch("/api/transcribe", {
@@ -110,7 +115,13 @@ export default function Home() {
 
       clearTimeout(timeoutId);
 
-      const data = await response.json();
+      const text = await response.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        throw new Error("Erro no servidor. Tente novamente.");
+      }
 
       if (!response.ok) {
         throw new Error(data.error || "Erro ao transcrever o vídeo.");
