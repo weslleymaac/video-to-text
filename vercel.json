@@ -1,6 +1,6 @@
 {
   "buildCommand": "npm run build",
-  "installCommand": "npm install && pip install -r requirements.txt",
+  "installCommand": "npm install",
   "framework": "nextjs",
   "functions": {
     "api/*.py": {
